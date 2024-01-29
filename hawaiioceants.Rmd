@@ -1,0 +1,296 @@
+---
+title: "Statistical Methods for Ecology With The Hawaii Ocean Time-series (HOT)"
+author: "Boopalakrishnan Arul"
+date: "2024-01-28"
+output: pdf_document
+---
+
+## Introduction
+
+Since 1998, the University of Hawai'i at Manoa has maintained the Hawaii Ocean Time-series, a continuous record of [ecological and physicochemical measurements](https://hahana.soest.hawaii.edu/hot/dataaccess.html) taken at varying depths in [a location north of Oahu](https://hahana.soest.hawaii.edu/hot/intro.html#). This notebook will look at a subset of that data: the counts per millileter (# / mL) of four categories of microorganisms, as well as some relevant physical and chemical variables (depth, salinity). These cells were counted with flow cytometry.
+
+The categories of microorganisms surveyed are:
+- Prochlorococcus, a genus of cyanobacteria. They are among the most abundant primary producers on earth.
+- Synechococcus, another genus of cyanobacteria.
+- Autotrophic eukaryotes, in particular pico-eukaryotes (3 micrometers or less in size).
+- Heterotrophic bacteria and archaea. Since these are not as dependent on light, they are found in abundance at depths (< 100 m) where numbers of the other three categories taper off rapidly.
+
+More information at:
+https://hahana.soest.hawaii.edu/hot/methods/bact.html Describes basic details about the microorganism counts data.
+https://hahana.soest.hawaii.edu/hot/protocols/protocols.html?Chapter=15 For more in depth converage of the methods.
+https://hahana.soest.hawaii.edu/hot/methods/pprod.html Describes the primary productivity data which the bacterial counts data are included with.
+https://hahana.soest.hawaii.edu/FTP/hot/primary_production/Readme.pp Table specification of the dataset files.
+
+## Inspection of Data
+```{r}
+data <- read.csv2("processed_data.csv")
+data[1:5,]
+```
+The data in this notebook is a subset of the total HOT bacterial counts series, comprising 160 measurements taken from January 2020 to September 2022, at depths from 5 to 175 meters. 
+
+```{r}
+unique(data$Date)
+range(data$Depth)
+```
+
+Before creating a distance matrix from these observations, we can first 1) drop empty rows from the dataset 2) visually inspect the dataset for any patterns of periodicity or correlation.
+
+Empty cells in the dataset are marked with a "-9". Dropping any row containing these will allow us to retain 151 observations.
+
+```{r}
+categories <- c("Prochlorococcus", "HeterotrophBacteria", "Synechococcus", "PicoEukaryotes")
+counts.matrix <- data[,categories]
+retain.rows <- apply(counts.matrix, MARGIN = 1, 
+                     FUN = {function(row) all(row != c(-9, -9, -9, -9)) })
+
+#drop all rows with a -9, signifying data that wasn't recorded
+retained.data <- data[retain.rows,]
+nrow(retained.data)
+```
+
+This first series of plots will show the change in counts in each category over time.
+
+```{r}
+library(ggplot2)
+library(patchwork)
+
+summary.plots <- function (category) {
+  line.plot <- ggplot(retained.data, aes(x = Date, y = retained.data[,category], 
+                                         group = Depth,
+                                         col=as.factor(Depth))) + 
+    geom_point() +
+    geom_line() + 
+    scale_y_continuous(name = paste(category, "Counts (#/mL)")) + 
+    scale_color_discrete(name = "Depth") +
+    scale_x_discrete(guide = guide_axis(angle = 90))
+  
+  #bar plot that shows mean count with 1 SD error bars for each depth subset
+  #of each datum
+  depths <- unique(retained.data$Depth)
+  depths.summary <- data.frame(
+    Depth = depths,
+    Means = sapply(depths, 
+                   {function(depth) 
+                     mean(retained.data[retained.data$Depth == depth, category])}),
+    Stdevs = sapply(depths, 
+               {function(depth) 
+                 sd(retained.data[retained.data$Depth == depth, category])})
+  )
+  
+  bar.plot <- ggplot(depths.summary, aes(x = as.factor(Depth), y = Means, 
+                                         ymin = Means - Stdevs, 
+                                         ymax = Means + Stdevs)) +
+    geom_bar(stat="identity") +
+    geom_errorbar() + 
+    scale_x_discrete(name = "Depth") +
+    scale_y_continuous(name = "Average Count (#/mL)")
+  print(line.plot + bar.plot + plot_layout(ncol = 1, heights = c(1,1)))
+  depths.summary$CoefVariation <- depths.summary$Stdevs / depths.summary$Means
+  print(depths.summary)
+}
+```
+
+```{r}
+summary.plots("Prochlorococcus")
+```
+As expected of a photoautotroph, Prochlorococcus is found in higher numbers at shallow depths. For the depths in which Prochlorococcus is abundant, the coefficient of variation is 0.25 or less. Starting at 100 meters, the counts are generally lower but subject to proportionally greater swings.
+
+```{r}
+summary.plots("HeterotrophBacteria")
+```
+Heterotrophic microorganisms are the largest of the four categories, usually making up the majority of each sample in the timeseries. Standard deviations that would be considered large in the other three categories are proportionally no greater than 20% of the respective mean.
+
+```{r}
+summary.plots("Synechococcus")
+```
+```{r}
+summary.plots("PicoEukaryotes")
+```
+Synechococcus and autotrophic eukaryotes are much less common than the other two categories of cells, and have the greatest coefficients of variation. Of note here are relative spikes in eukaryote counts in late 2020 and throughout 2021, in the middle depth range of 75 to 125 meters. These spikes, along with a spike in Synechococcus throughout the water column in early 2021, coincide with a lack of similar peaks in Prochlorococcus and heterotrophs. 
+
+Autotrophs not only compete with each other for nutrients, but also for light. As the cell count in the water grows, the turbidity or opacity of the water column will increase, and less light will penetrate through the water. It's possible that reduced competition from the rival Prochlorococcus allowed Synechococcus and small eukaryotes to grow in numbers.
+
+## Distance Matrices and Ordination
+
+We could express the earlier observations about the autotrophic counts as a question: whether the samples taken in 2021, as a result of their distribution of the four categories, are really different from the samples taken in the preceding and succeeding year. We can cluster samples by their similarity or dissimilarity to each other by making a distance matrix, and applying an ordination technique like nonmetric multidimensional scaling (nMDS).
+
+```{r}
+library(vegan)
+
+retained.counts <- retained.data[,categories]
+relative.abundances <- decostand(retained.counts, method="total", MARGIN = 1)
+distance.matrix <- as.matrix( vegdist(relative.abundances, method="chisq"), labels = T)
+distance.matrix[1:6,1:6]
+```
+
+We will use Chi-squared distance to create the distance matrix, after first scaling all the counts so that they represent the relative abundance of each category. We use this distance instead of the more popular Bray-Curtis distance because we want differences in the shape of the distribution, such as an "unusual" relative rise in a previously rare category, to have a greater impact on the "distance" between two points. Bray-Curtis, a more common dissimilarity metric, is less sensitive to this.
+
+```{r}
+nonmetric.scaling <- metaMDS(distance.matrix, distance = "chisq", k = 2)
+```
+Nonmetric multidimensional scaling is an iterative algorithm that maximizes the correlation between two rank-ordered distance matrices. The first of these matrices is the "real" distance matrix: the distances between our actual samples, each of which is represented as a point in a 4-dimensional space. The second of these matrices is the ordination distance matrix, which will be populated with corresponding points in only 2 dimensions.
+
+```{r}
+nonmetric.scaling$stress
+retained.data$MDS1 <- nonmetric.scaling$points[,"MDS1"]
+retained.data$MDS2 <- nonmetric.scaling$points[,"MDS2"]
+#stressplot(nonmetric.scaling)
+```
+
+The objective is for the rank ordered ordination distance matrix to correlate with the rank ordered real distance matrix. When this is achieved, the "stress" value will be low, ideally below 0.05. Since the stress here is around 0.02 (the algorithm is iterative, and may reach a slightly different solution each time), we will choose to keep the results of this ordination. We will add the new coordinate values, representing the position of each sample within the ordination space, to the data frame containing other useful values: depth, salinity, and date of sampling.
+
+```{r}
+p1 <- ggplot(data = retained.data, aes(x = MDS1, y = MDS2, col = as.factor(Depth))) +
+  geom_point()
+p2 <- ggplot(data = retained.data, aes(x = MDS1, y = MDS2, col = Salinity)) +
+  geom_point()
+p3 <- ggplot(data = retained.data, aes(x = MDS1, y = MDS2, col = as.factor(Year))) +
+  geom_point()
+p4 <- ggplot(data = retained.data, aes(x = MDS1, y = MDS2, col = as.factor(Month))) +
+  geom_text(data = retained.data, aes(label = Month))
+p1 + p2 + p3 + p4 + plot_layout(ncol = 2)
+```
+The above four plots all represent the same ordination space-- the points are colored differently based on other properties associated with each sample. As can be seen here, the samples don't cluster particularly well by year, month, or salinity. They cluster best by depth, with samples of depth 75 and above on the left side of the graph and samples of depth 100 and below on the right side of the graph. Also of note is that samples from 2022 are, regardless of depth, associated with higher values along MDS2. It's possible that the year of sampling explains some variance. 
+
+```{r}
+distance.matrix.BC <- as.matrix( vegdist(retained.counts, method="bray"), labels = T)
+nMDS.BC <- metaMDS(distance.matrix.BC, distance = "bray", k = 2, trace = 0)
+nMDS.BC$stress
+retained.data$MDS1.BC <- nMDS.BC$points[,"MDS1"]
+retained.data$MDS2.BC <- nMDS.BC$points[,"MDS2"]
+```
+```{r}
+p1 <- ggplot(data = retained.data, aes(x = MDS1.BC, y = MDS2.BC, col = as.factor(Depth))) +
+  geom_point()
+p2 <- ggplot(data = retained.data, aes(x = MDS1.BC, y = MDS2.BC, col = as.factor(Month))) +
+  geom_text(label = retained.data$Month)
+p3 <- ggplot(data = retained.data, aes(x = MDS1.BC, y = MDS2.BC, col = as.factor(Year))) +
+  geom_point()
+p1 + p2 + p3 + plot_layout(nrow = 2)
+```
+The creation of a new ordination, based on Bray-Curtis dissimilarity instead of chi-squared distance, supports the importance of depth for the distance between samples: again, samples of differing depths are clustered in distinct regions along MDS1. The observation of samples from 2022 clustering along higher values of MDS2, however, does not hold here. 
+
+As for which distance measure is "better", I would still go with the chi-squared for the reasons discussed above-- however, the comparison does highlight that even if 2021's samples had a slightly different distribution of the two rarer categories, this change may not have been enough for these samples to be meaningfully distant from the other samples. In other words, the shape of a sample's distribution is largely determined by the most common categories within it, which are clearly the Prochlorococcus and the heterotrophic prokaryotes. As seen below, on average these two categories make up 99.6% of each sample.
+
+```{r}
+mean(relative.abundances$Prochlorococcus + relative.abundances$HeterotrophBacteria)
+```
+
+There are two other methods we can use to better understand how samples at different depths differ from each other: the distance-based redundancy analysis (dbRDA) and the analysis of similarities (ANOSIM). 
+
+dbRDA may look similar to nMDS, since it also creates a graph meant to be interpreted by visual inspection for clusters or gradients. However, nMDS is an "unconstrained" ordination technique in which the only input for the procedure is the distance matrix created from the (relative, absolute) species abundances, and the output is meant only to reflect the input as closely as possible. It is only by coloring or otherwise marking these ordination-space points that we can try and guess at which variables (depth, salinity, etc) are most associated with particular clusters or gradients of points.
+
+dbRDA is a "constrained" ordination method, with an additional input and objective. By treating the species-abundance distance matrix as a "response", dbRDA tries to relate it one or several explanatory variables.
+
+dbRDA is a generalized version of redundancy analysis (RDA), and has a similar relationship to it as the lesser known "principal coordinates analysis" (PCoA, also known as metric or classical multidimensional scaling or MDS) has with the more famous principal components analysis (PCA). RDA and PCA also try to create lower-dimensional representations of a high-dimensional set of points, and both do so by preserving the relationship between high-dimensional distance and lower-dimension ordination distance. In the case of these methods, their definition of distance is only "Euclidean distance", the shortest path between two points in an n-dimensional space. 
+
+PCoA does for PCA what dbRDA does for RDA: allow the same method, but with a different definition of distance. This lets us use our chi-squared and Bray-Curtis distance matrices from earlier. In fact, a dbRDA is done by first applying a PCoA to an input distance matrix, and then applying an RDA to the results of that.
+
+```{r}
+#left hand side of formula should be a distance/dissimilarity matrix created by vegdist
+#data will contain the variables on right side of formula
+chisq.dbRDA <- dbrda(formula = distance.matrix ~ Depth + Salinity + Year + Month,
+                     data = retained.data)
+chisq.dbRDA
+summary(chisq.dbRDA)$concont
+```
+The most important values in this summary are the constrained and unconstrained proportions of the variance (second column). 64% of the variance is accounted for by these four explanatory variables. Next are the importance of each of the three components or axes produced by the dbRDA. dbRDA1 alone explains almost all of the variance. 
+
+```{r}
+plot(chisq.dbRDA, xlim = c(-10, 10), ylim = c(-10, 10))
+```
+dbRDA1 also turns out to be most parallel with the vector representing Depth's association with the dbRDA axes (a vector perpendicular to an axis could explain none of the variance along that axis; the opposite is true of a parallel vector). As can be seen below, even having Depth alone as the one explanatory variable would still explain 61% of the variance.
+
+```{r}
+chisq.dbRDA.onevar <- dbrda(formula = distance.matrix ~ Depth,
+                     data = retained.data)
+chisq.dbRDA.onevar
+summary(chisq.dbRDA.onevar)$concont
+plot(chisq.dbRDA.onevar)
+```
+
+```{r}
+BC.dbRDA = dbrda(distance.matrix.BC ~ Depth + Salinity + Month + Year, 
+                 data = retained.data,
+                 distance = "bray")
+summary(BC.dbRDA)$concont
+plot(BC.dbRDA)
+```
+The near-parabolic shape of the dbRDA based on Bray-Curtis distances is a surprise. The geometry of that looks interesting but I'm not sure how to explain that yet.
+
+## Distance Matrices and Hypothesis Testing
+
+Analysis of Similarity (ANOSIM) is not an ordination/visualization technique, but a hypothesis test for statistically significant differences between groups. Imagine a line that runs between the points, separating them into two categories: for example, "shallow" (depth <= 75) and "deep" (depth >= 100).
+
+```{r}
+retained.data$DepthBinary <- retained.data$Depth <= 75
+```
+
+The ANOSIM will take the distance matrix and separate the distances into two categories: those that cross this imaginary line (distances "between" groups) and those that don't (distances "within" groups). All the distances are replaced by their "ranks" (the smallest is rank 1, and counting up from there). If the average rank of the within-group distances is smaller than the average rank of the between-group distances, and if this difference is "extreme" within the distribution of such size differences (a distribution obtained by running the algorithm hundreds of times with different permutations of the distances), then there is a statistically significant difference between the two groups of points.
+
+```{r}
+anosim.chisq.depthbinary <- anosim(distance.matrix, grouping = retained.data$DepthBinary, permutations = 999)
+plot(anosim.chisq.depthbinary)
+
+anosim.chisq.depthfactor <- anosim(distance.matrix, grouping = retained.data$Depth, permutations = 999)
+plot(anosim.chisq.depthfactor)
+
+anosim.BC.depthbinary <- anosim(distance.matrix, grouping = retained.data$DepthBinary, permutations = 999)
+plot(anosim.BC.depthbinary)
+
+anosim.BC.depthfactor <- anosim(distance.matrix, grouping = retained.data$Depth, permutations = 999)
+plot(anosim.BC.depthfactor)
+```
+The test statistic "R" returned by ANOSIM is -1 when all the lowest-rank differences are between groups, 0 when there is a mix of high- and low- rank differences within (and between) groups, and 1 when the lowest-rank / smallest differences are all within groups. Whether depth is a binary factor or represented by all eight levels in the original dataset, and whether Bray Curtis or chi-squared distances are used, the ANOSIM calculates R to be above 0.5, a result with a p-value of 0.001. We can therefore conclude that the differences between samples taken at different depths are statistically significant.
+
+```{r}
+anosim.chisq.yearfactor <- anosim(distance.matrix, grouping = retained.data$Year,
+                                  permutations = 999)
+plot(anosim.chisq.yearfactor)
+
+anosim.chisq.monthfactor <- anosim(distance.matrix, grouping = retained.data$Month,
+                                   permutations = 999)
+plot(anosim.chisq.monthfactor)
+```
+Grouping by the year of sampling does not produce groups of samples with statistically significant differences. The month of sampling has a more impressive result, but this may be because there are too many groups for ANOSIM to handle effectively and too few samples within each group (there are only 151 samples retained by this experiment).
+
+## Conclusion
+
+The Hawaiian Ocean Time-series turned out to be an interesting preview of challenges in this field of study. It may not be uncommon to find other environments where the distribution of a sample is largely dominated by very few categories of organisms, in turn making the explanatory variables that most affect those organisms' distributions into the variables that best explain the sample overall. The nMDS and dbRDA illustrated what the ANOSIM confirmed: that the top layer of the ocean, where so much of the world's primary production takes place, is itself a collection of diverse environments defined by availability of light, nutrients, and other rudiments of life.
+
+## References and Helpful Resources
+
+https://chrischizinski.github.io/rstats/vegan-ggplot2/
+
+https://uw.pressbooks.pub/appliedmultivariatestatistics/chapter/rda-and-dbrda/
+
+https://uw.pressbooks.pub/appliedmultivariatestatistics/chapter/anosim/
+
+https://rdrr.io/cran/vegan/man/capscale.html
+
+## Footnote
+```{r}
+shallow.data <- retained.data[retained.data$Depth <= 75,]
+dim(shallow.data)
+shallow.rel.abundance <- decostand(shallow.data[,categories], method="total", MARGIN = 1)
+shallow.distance.matrix <- as.matrix( vegdist(shallow.rel.abundance, method="chisq"), 
+                                      labels = T)
+nMDS.shallow <- metaMDS(shallow.distance.matrix, distance = "chisq", k = 2, trace = 0)
+nMDS.shallow$stress
+shallow.data$MDS1 <- nMDS.shallow$points[,"MDS1"]
+shallow.data$MDS2 <- nMDS.shallow$points[,"MDS2"]
+```
+
+```{r}
+p1 <- ggplot(data = shallow.data, aes(x = MDS1, y = MDS2, col = as.factor(Depth))) +
+  geom_point()
+p2 <- ggplot(data = shallow.data, aes(x = MDS1, y = MDS2, col = Salinity)) +
+  geom_point()
+p3 <- ggplot(data = shallow.data, aes(x = MDS1, y = MDS2, col = as.factor(Year))) +
+  geom_point()
+p4 <- ggplot(data = shallow.data, aes(x = MDS1, y = MDS2, col = as.factor(Month))) +
+  geom_text(data = shallow.data, aes(label = Month))
+p1 + p2 + p3 + p4 + plot_layout(ncol = 2)
+
+```
+This last attempt doesn't so much affect the previous finding, but it shows a property of distance and dissimilarity metrics. Since chi-squared distance satisfies the mathematical definition of a distance, running nMDS on a subset of points produces a cluster whose arrangement is similar to the arrangement of these points within the larger set.
